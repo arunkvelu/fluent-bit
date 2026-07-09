@@ -1194,7 +1194,8 @@ int flb_tail_file_set_pending_bytes(struct flb_tail_file *file, off_t size)
     ctx = file->config;
     start_offset = file->offset;
 
-    if (ctx->whole_file_on_update == FLB_TRUE) {
+    if (ctx->whole_file_on_update == FLB_TRUE &&
+        file->tail_mode == FLB_TAIL_EVENT) {
         start_offset = 0;
     }
 
@@ -1261,6 +1262,7 @@ static int set_file_position(struct flb_tail_config *ctx,
             }
 
             if (ctx->whole_file_on_update == FLB_TRUE &&
+                file->tail_mode == FLB_TAIL_EVENT &&
                 file->size > file->offset) {
                 return flb_tail_file_set_pending_bytes(file, file->size);
             }
@@ -1297,6 +1299,7 @@ static int set_file_position(struct flb_tail_config *ctx,
      * files that have no prior read position. */
     if (explicit_offset) {
         if (ctx->whole_file_on_update == FLB_TRUE &&
+            file->tail_mode == FLB_TAIL_EVENT &&
             file->size > file->offset) {
             return flb_tail_file_set_pending_bytes(file, file->size);
         }

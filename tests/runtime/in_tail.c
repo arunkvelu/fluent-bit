@@ -2821,6 +2821,131 @@ void flb_test_db_whole_file_on_update()
     unlink(db);
 }
 
+void flb_test_db_whole_file_on_update_startup_offset()
+{
+    struct flb_lib_out_cb cb_data;
+    struct test_tail_ctx *ctx;
+    char *file[] = {"test_db_whole_file_on_update_startup_offset.log"};
+    char *db = "test_db_whole_file_on_update_startup_offset.db";
+    char *msg1 = "db startup first line";
+    char *msg2 = "db startup second line";
+    char *msg3 = "db startup third line";
+    const int expected_first = 1;
+    const int expected_startup_catchup = 1;
+    const int expected_after_event_update = 4;
+    int i;
+    int ret;
+    int num;
+    int unused;
+
+    unlink(db);
+    clear_output_num();
+
+    cb_data.cb = cb_count_msgpack;
+    cb_data.data = &unused;
+
+    ctx = test_tail_ctx_create(&cb_data, &file[0],
+                               sizeof(file)/sizeof(char *), FLB_TRUE);
+    if (!TEST_CHECK(ctx != NULL)) {
+        TEST_MSG("test_ctx_create failed");
+        exit(EXIT_FAILURE);
+    }
+
+    ret = flb_input_set(ctx->flb, ctx->o_ffd,
+                        "path", file[0],
+                        "db", db,
+                        "db.sync", "full",
+                        "whole_file_on_update", "on",
+                        NULL);
+    TEST_CHECK(ret == 0);
+
+    ret = flb_start(ctx->flb);
+    TEST_CHECK(ret == 0);
+
+    ret = write_msg(ctx, msg1, strlen(msg1));
+    if (!TEST_CHECK(ret > 0)) {
+        test_tail_ctx_destroy(ctx);
+        unlink(db);
+        exit(EXIT_FAILURE);
+    }
+
+    wait_expected_num_with_timeout(5000, expected_first, &num);
+    if (!TEST_CHECK(num == expected_first)) {
+        TEST_MSG("output num error. expect=%d got=%d", expected_first, num);
+        test_tail_ctx_destroy(ctx);
+        unlink(db);
+        return;
+    }
+
+    if (ctx->fds != NULL) {
+        for (i=0; i<ctx->fd_num; i++) {
+            close(ctx->fds[i]);
+        }
+        flb_free(ctx->fds);
+    }
+    flb_stop(ctx->flb);
+    flb_destroy(ctx->flb);
+    flb_free(ctx);
+
+    clear_output_num();
+
+    cb_data.cb = cb_count_msgpack;
+    cb_data.data = &unused;
+
+    ctx = test_tail_ctx_create(&cb_data, &file[0],
+                               sizeof(file)/sizeof(char *), FLB_FALSE);
+    if (!TEST_CHECK(ctx != NULL)) {
+        TEST_MSG("test_ctx_create failed");
+        unlink(db);
+        exit(EXIT_FAILURE);
+    }
+
+    ret = flb_input_set(ctx->flb, ctx->o_ffd,
+                        "path", file[0],
+                        "db", db,
+                        "db.sync", "full",
+                        "whole_file_on_update", "on",
+                        NULL);
+    TEST_CHECK(ret == 0);
+
+    ret = write_msg(ctx, msg2, strlen(msg2));
+    if (!TEST_CHECK(ret > 0)) {
+        test_tail_ctx_destroy(ctx);
+        unlink(db);
+        exit(EXIT_FAILURE);
+    }
+
+    ret = flb_start(ctx->flb);
+    TEST_CHECK(ret == 0);
+
+    wait_expected_num_with_timeout(5000, expected_startup_catchup, &num);
+    flb_time_msleep(500);
+    num = get_output_num();
+    if (!TEST_CHECK(num == expected_startup_catchup)) {
+        TEST_MSG("output num error. expect=%d got=%d",
+                 expected_startup_catchup, num);
+        test_tail_ctx_destroy(ctx);
+        unlink(db);
+        return;
+    }
+
+    ret = write_msg(ctx, msg3, strlen(msg3));
+    if (!TEST_CHECK(ret > 0)) {
+        test_tail_ctx_destroy(ctx);
+        unlink(db);
+        exit(EXIT_FAILURE);
+    }
+
+    wait_expected_num_with_timeout(5000, expected_after_event_update, &num);
+    if (!TEST_CHECK(num == expected_after_event_update)) {
+        TEST_MSG("output num error. expect=%d got=%d",
+                 expected_after_event_update, num);
+    }
+
+    test_tail_ctx_destroy(ctx);
+    unlink(db);
+}
+
 void flb_test_db_delete_stale_file()
 {
     struct flb_lib_out_cb cb_data;
@@ -3190,6 +3315,8 @@ TEST_LIST = {
 #ifdef FLB_HAVE_SQLDB
     {"db", flb_test_db},
     {"db_whole_file_on_update", flb_test_db_whole_file_on_update},
+    {"db_whole_file_on_update_startup_offset",
+     flb_test_db_whole_file_on_update_startup_offset},
     {"db_delete_stale_file", flb_test_db_delete_stale_file},
     {"db_compare_filename", flb_test_db_compare_filename},
 #endif

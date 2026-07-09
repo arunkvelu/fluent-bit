@@ -101,7 +101,7 @@ That helper receives the current file size and decides the next read start:
 if file->offset >= current_size:
     pending_bytes = 0
 
-else if ctx->whole_file_on_update:
+else if ctx->whole_file_on_update and file is in event mode:
     start_offset = 0
     seek(0)
     file->offset = 0
@@ -119,9 +119,10 @@ position through the current database update path.
 ## Modified Code Paths
 
 The new helper is reused by the paths that already detect file growth or prepare
-pending bytes:
+pending bytes. It only rewinds to the beginning after the file has been promoted
+to event mode, so startup scans and database-offset catch-up keep their normal
+offset-based behavior:
 
-- initial file append and DB offset restoration in `tail_file.c`
 - static file promotion to event mode in `tail_file.c`
 - pending event collection in `tail.c`
 - inotify growth reconciliation in `tail_fs_inotify.c`
