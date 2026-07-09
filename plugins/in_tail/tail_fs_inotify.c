@@ -198,14 +198,21 @@ static int reconcile_file_state(struct flb_tail_config *ctx,
         }
     }
 
-    if (file->offset < st.st_size) {
-        file->pending_bytes = (st.st_size - file->offset);
-        if (pending_data_detected != NULL) {
-            *pending_data_detected = FLB_TRUE;
+    if (size_delta > 0) {
+        ret = flb_tail_file_set_pending_bytes(file, st.st_size);
+        if (ret == -1) {
+            return -1;
         }
+    }
+    else if (file->offset < st.st_size) {
+        file->pending_bytes = (st.st_size - file->offset);
     }
     else {
         file->pending_bytes = 0;
+    }
+
+    if (file->pending_bytes > 0 && pending_data_detected != NULL) {
+        *pending_data_detected = FLB_TRUE;
     }
 
     if (st.st_nlink == 0) {

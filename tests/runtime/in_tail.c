@@ -1606,7 +1606,8 @@ void flb_test_offset_key()
     }
 
 
-    ctx = test_tail_ctx_create(&cb_data, &file[0], sizeof(file)/sizeof(char *), FLB_TRUE);
+    ctx = test_tail_ctx_create(&cb_data, &file[0],
+                               sizeof(file)/sizeof(char *), FLB_TRUE);
     if (!TEST_CHECK(ctx != NULL)) {
         TEST_MSG("test_ctx_create failed");
         exit(EXIT_FAILURE);
@@ -1645,6 +1646,66 @@ void flb_test_offset_key()
     num = get_output_num();
     if (!TEST_CHECK(num > 0))  {
         TEST_MSG("no outputs");
+    }
+
+    test_tail_ctx_destroy(ctx);
+}
+
+void flb_test_whole_file_on_update()
+{
+    struct flb_lib_out_cb cb_data;
+    struct test_tail_ctx *ctx;
+    char *file[] = {"whole_file_on_update.log"};
+    char *msg1 = "first line";
+    char *msg2 = "second line";
+    const int expected_first = 1;
+    const int expected_total = 3;
+    int ret;
+    int num;
+    int unused;
+
+    clear_output_num();
+
+    cb_data.cb = cb_count_msgpack;
+    cb_data.data = &unused;
+
+    ctx = test_tail_ctx_create(&cb_data, &file[0], sizeof(file)/sizeof(char *), FLB_TRUE);
+    if (!TEST_CHECK(ctx != NULL)) {
+        TEST_MSG("test_ctx_create failed");
+        exit(EXIT_FAILURE);
+    }
+
+    ret = flb_input_set(ctx->flb, ctx->o_ffd,
+                        "path", file[0],
+                        "whole_file_on_update", "on",
+                        NULL);
+    TEST_CHECK(ret == 0);
+
+    ret = flb_start(ctx->flb);
+    TEST_CHECK(ret == 0);
+
+    ret = write_msg(ctx, msg1, strlen(msg1));
+    if (!TEST_CHECK(ret > 0)) {
+        test_tail_ctx_destroy(ctx);
+        exit(EXIT_FAILURE);
+    }
+
+    wait_expected_num_with_timeout(5000, expected_first, &num);
+    if (!TEST_CHECK(num == expected_first)) {
+        TEST_MSG("output num error. expect=%d got=%d", expected_first, num);
+        test_tail_ctx_destroy(ctx);
+        return;
+    }
+
+    ret = write_msg(ctx, msg2, strlen(msg2));
+    if (!TEST_CHECK(ret > 0)) {
+        test_tail_ctx_destroy(ctx);
+        exit(EXIT_FAILURE);
+    }
+
+    wait_expected_num_with_timeout(5000, expected_total, &num);
+    if (!TEST_CHECK(num == expected_total)) {
+        TEST_MSG("output num error. expect=%d got=%d", expected_total, num);
     }
 
     test_tail_ctx_destroy(ctx);
@@ -2655,6 +2716,111 @@ void flb_test_db()
     unlink(db);
 }
 
+void flb_test_db_whole_file_on_update()
+{
+    struct flb_lib_out_cb cb_data;
+    struct test_tail_ctx *ctx;
+    char *file[] = {"test_db_whole_file_on_update.log"};
+    char *db = "test_db_whole_file_on_update.db";
+    char *msg1 = "db first line";
+    char *msg2 = "db second line";
+    const int expected_first = 1;
+    const int expected_after_restart = 2;
+    int i;
+    int ret;
+    int num;
+    int unused;
+
+    unlink(db);
+    clear_output_num();
+
+    cb_data.cb = cb_count_msgpack;
+    cb_data.data = &unused;
+
+    ctx = test_tail_ctx_create(&cb_data, &file[0],
+                               sizeof(file)/sizeof(char *), FLB_TRUE);
+    if (!TEST_CHECK(ctx != NULL)) {
+        TEST_MSG("test_ctx_create failed");
+        exit(EXIT_FAILURE);
+    }
+
+    ret = flb_input_set(ctx->flb, ctx->o_ffd,
+                        "path", file[0],
+                        "db", db,
+                        "db.sync", "full",
+                        "whole_file_on_update", "on",
+                        NULL);
+    TEST_CHECK(ret == 0);
+
+    ret = flb_start(ctx->flb);
+    TEST_CHECK(ret == 0);
+
+    ret = write_msg(ctx, msg1, strlen(msg1));
+    if (!TEST_CHECK(ret > 0)) {
+        test_tail_ctx_destroy(ctx);
+        unlink(db);
+        exit(EXIT_FAILURE);
+    }
+
+    wait_expected_num_with_timeout(5000, expected_first, &num);
+    if (!TEST_CHECK(num == expected_first)) {
+        TEST_MSG("output num error. expect=%d got=%d", expected_first, num);
+        test_tail_ctx_destroy(ctx);
+        unlink(db);
+        return;
+    }
+
+    if (ctx->fds != NULL) {
+        for (i=0; i<ctx->fd_num; i++) {
+            close(ctx->fds[i]);
+        }
+        flb_free(ctx->fds);
+    }
+    flb_stop(ctx->flb);
+    flb_destroy(ctx->flb);
+    flb_free(ctx);
+
+    clear_output_num();
+
+    cb_data.cb = cb_count_msgpack;
+    cb_data.data = &unused;
+
+    ctx = test_tail_ctx_create(&cb_data, &file[0],
+                               sizeof(file)/sizeof(char *), FLB_FALSE);
+    if (!TEST_CHECK(ctx != NULL)) {
+        TEST_MSG("test_ctx_create failed");
+        unlink(db);
+        exit(EXIT_FAILURE);
+    }
+
+    ret = flb_input_set(ctx->flb, ctx->o_ffd,
+                        "path", file[0],
+                        "db", db,
+                        "db.sync", "full",
+                        "whole_file_on_update", "on",
+                        NULL);
+    TEST_CHECK(ret == 0);
+
+    ret = flb_start(ctx->flb);
+    TEST_CHECK(ret == 0);
+
+    ret = write_msg(ctx, msg2, strlen(msg2));
+    if (!TEST_CHECK(ret > 0)) {
+        test_tail_ctx_destroy(ctx);
+        unlink(db);
+        exit(EXIT_FAILURE);
+    }
+
+    wait_expected_num_with_timeout(5000, expected_after_restart, &num);
+    if (!TEST_CHECK(num == expected_after_restart)) {
+        TEST_MSG("output num error. expect=%d got=%d",
+                 expected_after_restart, num);
+    }
+
+    test_tail_ctx_destroy(ctx);
+    unlink(db);
+}
+
 void flb_test_db_delete_stale_file()
 {
     struct flb_lib_out_cb cb_data;
@@ -3002,6 +3168,7 @@ TEST_LIST = {
     {"path_key", flb_test_path_key},
     {"exclude_path", flb_test_exclude_path},
     {"offset_key", flb_test_offset_key},
+    {"whole_file_on_update", flb_test_whole_file_on_update},
     {"multiline_offset_key", flb_test_multiline_offset_key},
     {"skip_empty_lines", flb_test_skip_empty_lines},
     {"skip_empty_lines_crlf", flb_test_skip_empty_lines_crlf},
@@ -3022,6 +3189,7 @@ TEST_LIST = {
 
 #ifdef FLB_HAVE_SQLDB
     {"db", flb_test_db},
+    {"db_whole_file_on_update", flb_test_db_whole_file_on_update},
     {"db_delete_stale_file", flb_test_db_delete_stale_file},
     {"db_compare_filename", flb_test_db_compare_filename},
 #endif

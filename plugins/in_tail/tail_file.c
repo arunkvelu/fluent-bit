@@ -1180,6 +1180,55 @@ static inline int flb_tail_file_exists(struct stat *st,
     return FLB_FALSE;
 }
 
+int flb_tail_file_set_pending_bytes(struct flb_tail_file *file, off_t size)
+{
+    off_t start_offset;
+    struct flb_tail_config *ctx;
+    struct flb_decompression_context *decompression_context;
+
+    if (file->offset >= size) {
+        file->pending_bytes = 0;
+        return 0;
+    }
+
+    ctx = file->config;
+    start_offset = file->offset;
+
+    if (ctx->whole_file_on_update == FLB_TRUE) {
+        start_offset = 0;
+    }
+
+    if (start_offset != file->offset) {
+        if (lseek(file->fd, start_offset, SEEK_SET) == -1) {
+            flb_errno();
+            return -1;
+        }
+
+        file->offset = start_offset;
+        file->last_processed_bytes = 0;
+        file->buf_len = 0;
+
+        if (file->decompression_context == NULL) {
+            file->stream_offset = start_offset;
+        }
+        else {
+            decompression_context = flb_decompression_context_create(
+                                        file->decompression_context->algorithm,
+                                        ctx->buf_max_size);
+
+            if (decompression_context == NULL) {
+                return -1;
+            }
+
+            flb_decompression_context_destroy(file->decompression_context);
+            file->decompression_context = decompression_context;
+        }
+    }
+
+    file->pending_bytes = size - start_offset;
+    return 0;
+}
+
 /*
  * Based in the configuration or database offset, set the proper 'offset' for the
  * file in question.
@@ -1209,6 +1258,11 @@ static int set_file_position(struct flb_tail_config *ctx,
                 file->offset = 0;
                 file->stream_offset = 0;
                 flb_tail_db_file_offset(file, ctx);
+            }
+
+            if (ctx->whole_file_on_update == FLB_TRUE &&
+                file->size > file->offset) {
+                return flb_tail_file_set_pending_bytes(file, file->size);
             }
 
             if (file->offset > 0) {
@@ -1242,6 +1296,11 @@ static int set_file_position(struct flb_tail_config *ctx,
      * even when read_from_head is true; the flag only governs truly new
      * files that have no prior read position. */
     if (explicit_offset) {
+        if (ctx->whole_file_on_update == FLB_TRUE &&
+            file->size > file->offset) {
+            return flb_tail_file_set_pending_bytes(file, file->size);
+        }
+
         ret = lseek(file->fd, file->offset, SEEK_SET);
 
         if (ret == -1) {
@@ -1607,7 +1666,9 @@ int flb_tail_file_append(char *path, struct stat *st, int mode,
     }
 
     /* Remaining bytes to read */
-    file->pending_bytes = file->size - file->offset;
+    if (flb_tail_file_set_pending_bytes(file, file->size) != 0) {
+        goto err_fs_remove;
+    }
 
     file->sl_log_event_encoder = flb_log_event_encoder_create(
                                     FLB_LOG_EVENT_FORMAT_DEFAULT);
@@ -2183,12 +2244,12 @@ int flb_tail_file_to_event(struct flb_tail_file *file)
         return -1;
     }
 
-    if (file->offset < st.st_size) {
-        file->pending_bytes = (st.st_size - file->offset);
-        tail_signal_pending(file->config);
+    if (flb_tail_file_set_pending_bytes(file, st.st_size) == -1) {
+        return -1;
     }
-    else {
-        file->pending_bytes = 0;
+
+    if (file->pending_bytes > 0) {
+        tail_signal_pending(file->config);
     }
 
     /* Check if the file has been rotated */

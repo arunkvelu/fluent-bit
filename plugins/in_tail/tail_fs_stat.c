@@ -146,12 +146,21 @@ static int tail_fs_check(struct flb_input_instance *ins,
 #endif
         }
 
-        if (file->offset < st.st_size) {
+        if (size_delta > 0) {
+            ret = flb_tail_file_set_pending_bytes(file, st.st_size);
+            if (ret == -1) {
+                return -1;
+            }
+        }
+        else if (file->offset < st.st_size) {
             file->pending_bytes = (st.st_size - file->offset);
-            tail_signal_pending(ctx);
         }
         else {
             file->pending_bytes = 0;
+        }
+
+        if (file->pending_bytes > 0) {
+            tail_signal_pending(ctx);
         }
 
 

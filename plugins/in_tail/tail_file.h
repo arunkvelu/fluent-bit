@@ -129,6 +129,7 @@ int flb_tail_file_is_rotated(struct flb_tail_config *ctx,
 int flb_tail_file_rotated(struct flb_tail_file *file);
 int flb_tail_file_purge(struct flb_input_instance *ins,
                         struct flb_config *config, void *context);
+int flb_tail_file_set_pending_bytes(struct flb_tail_file *file, off_t size);
 int flb_tail_pack_line_map(struct flb_time *time, char **data,
                            size_t *data_size, struct flb_tail_file *file,
                            size_t processed_bytes);

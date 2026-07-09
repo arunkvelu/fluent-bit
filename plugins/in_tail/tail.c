@@ -69,6 +69,7 @@ static int in_tail_collect_pending(struct flb_input_instance *ins,
     struct flb_tail_file *file;
     struct stat st;
     uint64_t pre;
+    int64_t previous_size;
     uint64_t total_processed = 0;
 
     /* Iterate promoted event files with pending bytes */
@@ -84,8 +85,19 @@ static int in_tail_collect_pending(struct flb_input_instance *ins,
                 flb_tail_file_remove(file);
                 continue;
             }
+            previous_size = file->size;
             file->size = st.st_size;
-            file->pending_bytes = (file->size - file->offset);
+
+            if (st.st_size > previous_size) {
+                ret = flb_tail_file_set_pending_bytes(file, file->size);
+                if (ret == -1) {
+                    flb_tail_file_remove(file);
+                    continue;
+                }
+            }
+            else {
+                file->pending_bytes = (file->size - file->offset);
+            }
         }
         else {
             memset(&st, 0, sizeof(struct stat));
@@ -588,6 +600,12 @@ static struct flb_config_map config_map[] = {
      0, FLB_TRUE, offsetof(struct flb_tail_config, read_from_head),
      "For new discovered files on start (without a database offset/position), read the "
      "content from the head of the file, not tail."
+    },
+    {
+     FLB_CONFIG_MAP_BOOL, "whole_file_on_update", "false",
+     0, FLB_TRUE, offsetof(struct flb_tail_config, whole_file_on_update),
+     "When a monitored file grows, read and forward the whole file from the "
+     "beginning instead of only the appended content."
     },
     {
      FLB_CONFIG_MAP_BOOL, "read_newly_discovered_files_from_head", "true",
