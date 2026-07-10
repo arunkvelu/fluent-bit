@@ -23,6 +23,7 @@ Approach for this tests is basing on filter_kubernetes tests
 */
 
 #include <fluent-bit.h>
+#include <fluent-bit/flb_log_event_decoder.h>
 #include <fluent-bit/flb_time.h>
 #include <fluent-bit/flb_pthread.h>
 #include <fluent-bit/flb_compat.h>
@@ -42,6 +43,9 @@ Approach for this tests is basing on filter_kubernetes tests
 
 #define NEW_LINE "\n"
 #define PATH_SEPARATOR "/"
+#define FLB_TAIL_TEST_WHOLE_FILE_META_ACTIVE     "flb.tail.whole_file_on_update.active"
+#define FLB_TAIL_TEST_WHOLE_FILE_META_SOURCE     "flb.tail.whole_file_on_update.source"
+#define FLB_TAIL_TEST_WHOLE_FILE_META_GENERATION "flb.tail.whole_file_on_update.generation"
 
 #define DPATH_COMMON       FLB_TESTS_DATA_PATH "/data/common"
 
@@ -102,6 +106,102 @@ static int cb_count_msgpack(void *record, size_t size, void *data)
     }
     msgpack_unpacked_destroy(&result);
 
+    flb_free(record);
+    return 0;
+}
+
+struct whole_file_metadata_result {
+    const char *source;
+    int records;
+    int source_matches;
+    uint64_t max_generation;
+};
+
+static int metadata_key_matches(msgpack_object key, const char *str)
+{
+    size_t len;
+
+    if (key.type != MSGPACK_OBJECT_STR) {
+        return FLB_FALSE;
+    }
+
+    len = strlen(str);
+    if (key.via.str.size != len) {
+        return FLB_FALSE;
+    }
+
+    if (strncmp(key.via.str.ptr, str, len) == 0) {
+        return FLB_TRUE;
+    }
+
+    return FLB_FALSE;
+}
+
+static int cb_check_whole_file_metadata(void *record, size_t size, void *data)
+{
+    int ret;
+    int active;
+    int source_match;
+    int generation_found;
+    size_t i;
+    struct flb_log_event event;
+    struct flb_log_event_decoder decoder;
+    struct whole_file_metadata_result *result = data;
+    msgpack_object key;
+    msgpack_object val;
+    uint64_t generation;
+
+    ret = flb_log_event_decoder_init(&decoder, record, size);
+    if (ret != FLB_EVENT_DECODER_SUCCESS) {
+        flb_free(record);
+        return 0;
+    }
+
+    while (flb_log_event_decoder_next(&decoder, &event) == FLB_EVENT_DECODER_SUCCESS) {
+        if (event.metadata == NULL ||
+            event.metadata->type != MSGPACK_OBJECT_MAP) {
+            continue;
+        }
+
+        active = FLB_FALSE;
+        source_match = FLB_FALSE;
+        generation_found = FLB_FALSE;
+        generation = 0;
+
+        for (i = 0; i < event.metadata->via.map.size; i++) {
+            key = event.metadata->via.map.ptr[i].key;
+            val = event.metadata->via.map.ptr[i].val;
+
+            if (metadata_key_matches(key, FLB_TAIL_TEST_WHOLE_FILE_META_ACTIVE) &&
+                val.type == MSGPACK_OBJECT_BOOLEAN &&
+                val.via.boolean == true) {
+                active = FLB_TRUE;
+            }
+            else if (metadata_key_matches(key, FLB_TAIL_TEST_WHOLE_FILE_META_SOURCE) &&
+                     val.type == MSGPACK_OBJECT_STR &&
+                     val.via.str.size == strlen(result->source) &&
+                     strncmp(val.via.str.ptr, result->source, val.via.str.size) == 0) {
+                source_match = FLB_TRUE;
+            }
+            else if (metadata_key_matches(key, FLB_TAIL_TEST_WHOLE_FILE_META_GENERATION) &&
+                     val.type == MSGPACK_OBJECT_POSITIVE_INTEGER) {
+                generation = val.via.u64;
+                generation_found = FLB_TRUE;
+            }
+        }
+
+        if (active == FLB_TRUE && generation_found == FLB_TRUE) {
+            result->records++;
+            if (source_match == FLB_TRUE) {
+                result->source_matches++;
+            }
+            if (generation > result->max_generation) {
+                result->max_generation = generation;
+            }
+        }
+    }
+
+    flb_log_event_decoder_destroy(&decoder);
     flb_free(record);
     return 0;
 }
@@ -1711,6 +1811,68 @@ void flb_test_whole_file_on_update()
     test_tail_ctx_destroy(ctx);
 }
 
+void flb_test_whole_file_on_update_metadata()
+{
+    struct flb_lib_out_cb cb_data;
+    struct test_tail_ctx *ctx;
+    struct whole_file_metadata_result result;
+    char *file[] = {"whole_file_on_update_metadata.log"};
+    char *msg1 = "metadata first line";
+    char *msg2 = "metadata second line";
+    int ret;
+
+    memset(&result, 0, sizeof(result));
+    result.source = file[0];
+
+    cb_data.cb = cb_check_whole_file_metadata;
+    cb_data.data = &result;
+
+    ctx = test_tail_ctx_create(&cb_data, &file[0], sizeof(file)/sizeof(char *), FLB_TRUE);
+    if (!TEST_CHECK(ctx != NULL)) {
+        TEST_MSG("test_ctx_create failed");
+        exit(EXIT_FAILURE);
+    }
+
+    ret = flb_input_set(ctx->flb, ctx->o_ffd,
+                        "path", file[0],
+                        "whole_file_on_update", "on",
+                        NULL);
+    TEST_CHECK(ret == 0);
+
+    ret = flb_start(ctx->flb);
+    TEST_CHECK(ret == 0);
+
+    ret = write_msg(ctx, msg1, strlen(msg1));
+    if (!TEST_CHECK(ret > 0)) {
+        test_tail_ctx_destroy(ctx);
+        exit(EXIT_FAILURE);
+    }
+
+    ret = write_msg(ctx, msg2, strlen(msg2));
+    if (!TEST_CHECK(ret > 0)) {
+        test_tail_ctx_destroy(ctx);
+        exit(EXIT_FAILURE);
+    }
+
+    flb_time_msleep(1000);
+
+    if (!TEST_CHECK(result.records >= 3)) {
+        TEST_MSG("metadata record count error. expect >=3 got=%d", result.records);
+    }
+
+    if (!TEST_CHECK(result.source_matches == result.records)) {
+        TEST_MSG("metadata source match error. expect=%d got=%d",
+                 result.records, result.source_matches);
+    }
+
+    if (!TEST_CHECK(result.max_generation >= 2)) {
+        TEST_MSG("metadata generation error. expect >=2 got=%" PRIu64,
+                 result.max_generation);
+    }
+
+    test_tail_ctx_destroy(ctx);
+}
+
 void flb_test_multiline_offset_key()
 {
     struct flb_lib_out_cb cb_data;
@@ -3294,6 +3456,7 @@ TEST_LIST = {
     {"exclude_path", flb_test_exclude_path},
     {"offset_key", flb_test_offset_key},
     {"whole_file_on_update", flb_test_whole_file_on_update},
+    {"whole_file_on_update_metadata", flb_test_whole_file_on_update_metadata},
     {"multiline_offset_key", flb_test_multiline_offset_key},
     {"skip_empty_lines", flb_test_skip_empty_lines},
     {"skip_empty_lines_crlf", flb_test_skip_empty_lines_crlf},

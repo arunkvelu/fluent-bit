@@ -122,6 +122,10 @@ struct flb_tail_file {
     uint64_t hash_bits;
     flb_sds_t hash_key;
 
+    /* Whole-file update generation metadata for downstream outputs */
+    uint64_t whole_file_generation;
+    int whole_file_generation_active;
+
     /* There are dedicated log event encoders for
      * single and multi line events because I am respecting
      * the old behavior which resulted in grouping both types

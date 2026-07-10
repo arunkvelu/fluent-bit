@@ -2,6 +2,8 @@
 #include <fluent-bit.h>
 #include "flb_tests_runtime.h"
 #include "../include/flb_tests_tmpdir.h"
+#include "../../plugins/out_s3/s3.h"
+#include "../../plugins/out_s3/s3_store.h"
 #include <errno.h>
 
 #ifdef FLB_SYSTEM_WINDOWS
@@ -964,6 +966,85 @@ void flb_test_s3_default_retry_exhausted_action_quarantine(void)
     flb_free(store_dir);
 }
 
+void flb_test_s3_store_tail_source_generation_replace(void)
+{
+    int ret;
+    struct flb_s3 ctx;
+    struct s3_file *file;
+    struct s3_file *locked_file;
+    char *store_dir;
+    char *tag = "test";
+    char *source = "/tmp/whole-file.log";
+    char *first = "first\n";
+    char *second = "second\n";
+    char *third = "third\n";
+    char *fourth = "fourth\n";
+    char postfix[128];
+
+    snprintf(postfix, sizeof(postfix),
+             "/flb-s3-store-generation-%u", (unsigned) rand());
+    store_dir = flb_test_tmpdir_cat(postfix);
+    TEST_CHECK(store_dir != NULL);
+    TEST_CHECK(ensure_test_directory(store_dir) == 0);
+
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.buffer_dir = store_dir;
+
+    ret = s3_store_init(&ctx);
+    TEST_CHECK(ret == 0);
+
+    ret = s3_store_buffer_put(&ctx, NULL, tag, strlen(tag),
+                              first, strlen(first), time(NULL),
+                              source, strlen(source), 1);
+    TEST_CHECK(ret == 0);
+
+    file = s3_store_file_get_by_tail_source(&ctx, tag, strlen(tag),
+                                            source, strlen(source));
+    TEST_CHECK(file != NULL);
+    TEST_CHECK(file->tail_source_generation == 1);
+    TEST_CHECK(file->size == strlen(first));
+
+    ret = s3_store_buffer_put(&ctx, file, tag, strlen(tag),
+                              second, strlen(second), time(NULL),
+                              source, strlen(source), 1);
+    TEST_CHECK(ret == 0);
+    TEST_CHECK(file->tail_source_generation == 1);
+    TEST_CHECK(file->size == strlen(first) + strlen(second));
+
+    s3_store_file_delete(&ctx, file);
+    ret = s3_store_buffer_put(&ctx, NULL, tag, strlen(tag),
+                              third, strlen(third), time(NULL),
+                              source, strlen(source), 2);
+    TEST_CHECK(ret == 0);
+
+    file = s3_store_file_get_by_tail_source(&ctx, tag, strlen(tag),
+                                            source, strlen(source));
+    TEST_CHECK(file != NULL);
+    TEST_CHECK(file->tail_source_generation == 2);
+    TEST_CHECK(file->size == strlen(third));
+
+    locked_file = file;
+    s3_store_file_lock(locked_file);
+    file = s3_store_file_get_by_tail_source(&ctx, tag, strlen(tag),
+                                            source, strlen(source));
+    TEST_CHECK(file == NULL);
+
+    ret = s3_store_buffer_put(&ctx, NULL, tag, strlen(tag),
+                              fourth, strlen(fourth), time(NULL),
+                              source, strlen(source), 3);
+    TEST_CHECK(ret == 0);
+
+    file = s3_store_file_get_by_tail_source(&ctx, tag, strlen(tag),
+                                            source, strlen(source));
+    TEST_CHECK(file != NULL);
+    TEST_CHECK(file != locked_file);
+    TEST_CHECK(file->tail_source_generation == 3);
+    TEST_CHECK(file->size == strlen(fourth));
+
+    s3_store_exit(&ctx);
+    flb_free(store_dir);
+}
+
 /* Test list */
 TEST_LIST = {
     {"multipart_success", flb_test_s3_multipart_success },
@@ -982,5 +1063,6 @@ TEST_LIST = {
     {"compression_snappy", flb_test_s3_compression_snappy },
     {"compression_snappy_putobject", flb_test_s3_compression_snappy_putobject },
     {"preserve_data_ordering", flb_test_s3_preserve_data_ordering },
+    {"store_tail_source_generation_replace", flb_test_s3_store_tail_source_generation_replace },
     {NULL, NULL}
 };

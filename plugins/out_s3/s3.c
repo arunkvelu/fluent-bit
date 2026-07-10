@@ -45,11 +45,20 @@
 
 #define DEFAULT_S3_PORT 443
 #define DEFAULT_S3_INSECURE_PORT 80
+#define S3_TAIL_WHOLE_FILE_META_ACTIVE     "flb.tail.whole_file_on_update.active"
+#define S3_TAIL_WHOLE_FILE_META_SOURCE     "flb.tail.whole_file_on_update.source"
+#define S3_TAIL_WHOLE_FILE_META_GENERATION "flb.tail.whole_file_on_update.generation"
 
 /* thread_local_storage for workers */
 
 struct worker_info {
     int active_upload;
+};
+
+struct s3_tail_source_meta {
+    int found;
+    flb_sds_t source;
+    uint64_t generation;
 };
 
 FLB_TLS_DEFINE(struct worker_info, s3_worker_info);
@@ -91,6 +100,118 @@ static int blob_initialize_authorization_endpoint_upstream(struct flb_s3 *contex
 static flb_sds_t s3_format_event_chunk(struct flb_s3 *ctx,
                                        struct flb_event_chunk *event_chunk,
                                        struct flb_config *config);
+
+static void s3_tail_source_meta_init(struct s3_tail_source_meta *meta)
+{
+    meta->found = FLB_FALSE;
+    meta->source = NULL;
+    meta->generation = 0;
+}
+
+static void s3_tail_source_meta_destroy(struct s3_tail_source_meta *meta)
+{
+    if (meta->source != NULL) {
+        flb_sds_destroy(meta->source);
+    }
+
+    s3_tail_source_meta_init(meta);
+}
+
+static int msgpack_object_strcmp(msgpack_object *obj, const char *str)
+{
+    size_t len;
+
+    if (obj->type != MSGPACK_OBJECT_STR) {
+        return -1;
+    }
+
+    len = strlen(str);
+    if (obj->via.str.size != len) {
+        return -1;
+    }
+
+    return strncmp(obj->via.str.ptr, str, len);
+}
+
+static int extract_tail_source_metadata(struct flb_s3 *ctx,
+                                        struct flb_event_chunk *event_chunk,
+                                        struct s3_tail_source_meta *meta)
+{
+    int ret;
+    int active;
+    int source_found;
+    int generation_found;
+    size_t i;
+    struct flb_log_event_decoder log_decoder;
+    struct flb_log_event log_event;
+    msgpack_object key;
+    msgpack_object val;
+
+    ret = flb_log_event_decoder_init(&log_decoder,
+                                     (char *) event_chunk->data,
+                                     event_chunk->size);
+    if (ret != FLB_EVENT_DECODER_SUCCESS) {
+        flb_plg_debug(ctx->ins,
+                      "could not inspect Tail whole-file metadata: decoder error %d",
+                      ret);
+        return -1;
+    }
+
+    while ((ret = flb_log_event_decoder_next(
+                    &log_decoder,
+                    &log_event)) == FLB_EVENT_DECODER_SUCCESS) {
+        if (log_event.metadata == NULL ||
+            log_event.metadata->type != MSGPACK_OBJECT_MAP) {
+            continue;
+        }
+
+        active = FLB_FALSE;
+        source_found = FLB_FALSE;
+        generation_found = FLB_FALSE;
+
+        for (i = 0; i < log_event.metadata->via.map.size; i++) {
+            key = log_event.metadata->via.map.ptr[i].key;
+            val = log_event.metadata->via.map.ptr[i].val;
+
+            if (msgpack_object_strcmp(&key, S3_TAIL_WHOLE_FILE_META_ACTIVE) == 0 &&
+                val.type == MSGPACK_OBJECT_BOOLEAN &&
+                val.via.boolean == true) {
+                active = FLB_TRUE;
+            }
+            else if (msgpack_object_strcmp(&key, S3_TAIL_WHOLE_FILE_META_SOURCE) == 0 &&
+                     val.type == MSGPACK_OBJECT_STR) {
+                if (meta->source != NULL) {
+                    flb_sds_destroy(meta->source);
+                }
+
+                meta->source = flb_sds_create_len(val.via.str.ptr,
+                                                  val.via.str.size);
+                if (meta->source == NULL) {
+                    flb_errno();
+                    flb_log_event_decoder_destroy(&log_decoder);
+                    return -1;
+                }
+                source_found = FLB_TRUE;
+            }
+            else if (msgpack_object_strcmp(&key, S3_TAIL_WHOLE_FILE_META_GENERATION) == 0) {
+                if (val.type == MSGPACK_OBJECT_POSITIVE_INTEGER) {
+                    meta->generation = val.via.u64;
+                    generation_found = FLB_TRUE;
+                }
+            }
+        }
+
+        if (active == FLB_TRUE && source_found == FLB_TRUE &&
+            generation_found == FLB_TRUE && meta->generation > 0) {
+            meta->found = FLB_TRUE;
+            flb_log_event_decoder_destroy(&log_decoder);
+            return 0;
+        }
+    }
+
+    flb_log_event_decoder_destroy(&log_decoder);
+    return 0;
+}
 
 static struct flb_aws_header *get_content_encoding_header(int compression_type)
 {
@@ -892,6 +1013,13 @@ static int cb_s3_init(struct flb_output_instance *ins,
             flb_plg_error(ctx->ins, "Max total_file_size is 50M when use_put_object is enabled");
             return -1;
         }
+    }
+
+    if (ctx->replace_buffer_on_whole_file_update == FLB_TRUE &&
+        ctx->use_put_object == FLB_FALSE) {
+        flb_plg_error(ctx->ins,
+                      "replace_buffer_on_whole_file_update requires use_put_object");
+        return -1;
     }
 
 skip_size_validation:
@@ -1945,13 +2073,24 @@ static int send_upload_request(void *out_context, flb_sds_t chunk,
 static int buffer_chunk(void *out_context, struct s3_file *upload_file,
                         flb_sds_t chunk, int chunk_size,
                         const char *tag, int tag_len,
-                        time_t file_first_log_time)
+                        time_t file_first_log_time,
+                        struct s3_tail_source_meta *tail_meta)
 {
     int ret;
     struct flb_s3 *ctx = out_context;
+    const char *tail_source = NULL;
+    size_t tail_source_len = 0;
+    uint64_t tail_source_generation = 0;
+
+    if (tail_meta != NULL && tail_meta->found == FLB_TRUE) {
+        tail_source = tail_meta->source;
+        tail_source_len = flb_sds_len(tail_meta->source);
+        tail_source_generation = tail_meta->generation;
+    }
 
     ret = s3_store_buffer_put(ctx, upload_file, tag,
-                              tag_len, chunk, (size_t) chunk_size, file_first_log_time);
+                              tag_len, chunk, (size_t) chunk_size, file_first_log_time,
+                              tail_source, tail_source_len, tail_source_generation);
     flb_sds_destroy(chunk);
     if (ret < 0) {
         flb_plg_warn(ctx->ins, "Could not buffer chunk. Data order preservation "
@@ -3946,9 +4085,12 @@ static void cb_s3_flush(struct flb_event_chunk *event_chunk,
     struct s3_file *upload_file = NULL;
     struct flb_s3 *ctx = out_context;
     struct multipart_upload *m_upload_file = NULL;
+    struct s3_tail_source_meta tail_meta;
     time_t file_first_log_time = 0;
     struct flb_log_event_decoder log_decoder;
     struct flb_log_event log_event;
+
+    s3_tail_source_meta_init(&tail_meta);
 
     if (event_chunk->type == FLB_EVENT_TYPE_BLOBS) {
         /*
@@ -3966,18 +4108,49 @@ static void cb_s3_flush(struct flb_event_chunk *event_chunk,
     /* Cleanup old buffers and initialize upload timer */
     flush_init(ctx);
 
+    if (ctx->replace_buffer_on_whole_file_update == FLB_TRUE) {
+        ret = extract_tail_source_metadata(ctx, event_chunk, &tail_meta);
+        if (ret < 0) {
+            s3_tail_source_meta_destroy(&tail_meta);
+            FLB_OUTPUT_RETURN(FLB_ERROR);
+        }
+    }
+
     /* Process chunk */
     chunk = s3_format_event_chunk(ctx, event_chunk, config);
     if (chunk == NULL) {
         flb_plg_error(ctx->ins, "Could not marshal msgpack to output string");
+        s3_tail_source_meta_destroy(&tail_meta);
         FLB_OUTPUT_RETURN(FLB_ERROR);
     }
     chunk_size = flb_sds_len(chunk);
 
     /* Get a file candidate matching the given 'tag' */
-    upload_file = s3_store_file_get(ctx,
-                                    event_chunk->tag,
-                                    flb_sds_len(event_chunk->tag));
+    if (tail_meta.found == FLB_TRUE) {
+        upload_file = s3_store_file_get_by_tail_source(ctx,
+                                                       event_chunk->tag,
+                                                       flb_sds_len(event_chunk->tag),
+                                                       tail_meta.source,
+                                                       flb_sds_len(tail_meta.source));
+
+        if (upload_file != NULL &&
+            upload_file->tail_source_generation > 0 &&
+            tail_meta.generation > upload_file->tail_source_generation) {
+            flb_plg_info(ctx->ins,
+                         "discarding stale S3 buffer for Tail source %s "
+                         "(generation=%" PRIu64 " -> %" PRIu64 ")",
+                         tail_meta.source,
+                         upload_file->tail_source_generation,
+                         tail_meta.generation);
+            s3_store_file_delete(ctx, upload_file);
+            upload_file = NULL;
+        }
+    }
+    else {
+        upload_file = s3_store_file_get(ctx,
+                                        event_chunk->tag,
+                                        flb_sds_len(event_chunk->tag));
+    }
 
     if (upload_file == NULL) {
         ret = flb_log_event_decoder_init(&log_decoder,
@@ -3989,6 +4162,7 @@ static void cb_s3_flush(struct flb_event_chunk *event_chunk,
                           "Log event decoder initialization error : %d", ret);
 
             flb_sds_destroy(chunk);
+            s3_tail_source_meta_destroy(&tail_meta);
 
             FLB_OUTPUT_RETURN(FLB_ERROR);
         }
@@ -4050,9 +4224,10 @@ static void cb_s3_flush(struct flb_event_chunk *event_chunk,
             /* Buffer last chunk in file and lock file to prevent further changes */
             ret = buffer_chunk(ctx, upload_file, chunk, chunk_size,
                                event_chunk->tag, flb_sds_len(event_chunk->tag),
-                               file_first_log_time);
+                               file_first_log_time, &tail_meta);
 
             if (ret < 0) {
+                s3_tail_source_meta_destroy(&tail_meta);
                 FLB_OUTPUT_RETURN(FLB_RETRY);
             }
             s3_store_file_lock(upload_file);
@@ -4061,6 +4236,7 @@ static void cb_s3_flush(struct flb_event_chunk *event_chunk,
             ret = add_to_queue(ctx, upload_file, m_upload_file,
                                event_chunk->tag, flb_sds_len(event_chunk->tag));
             if (ret < 0) {
+                s3_tail_source_meta_destroy(&tail_meta);
                 FLB_OUTPUT_RETURN(FLB_ERROR);
             }
 
@@ -4068,8 +4244,10 @@ static void cb_s3_flush(struct flb_event_chunk *event_chunk,
             s3_upload_queue(config, ctx);
             if (ctx->upload_queue_success == FLB_FALSE) {
                 ctx->upload_queue_success = FLB_TRUE;
+                s3_tail_source_meta_destroy(&tail_meta);
                 FLB_OUTPUT_RETURN(FLB_ERROR);
             }
+            s3_tail_source_meta_destroy(&tail_meta);
             FLB_OUTPUT_RETURN(FLB_OK);
         }
         else {
@@ -4078,8 +4256,10 @@ static void cb_s3_flush(struct flb_event_chunk *event_chunk,
                                       event_chunk->tag,
                                       flb_sds_len(event_chunk->tag));
             if (ret < 0) {
+                s3_tail_source_meta_destroy(&tail_meta);
                 FLB_OUTPUT_RETURN(FLB_ERROR);
             }
+            s3_tail_source_meta_destroy(&tail_meta);
             FLB_OUTPUT_RETURN(ret);
         }
     }
@@ -4087,11 +4267,13 @@ static void cb_s3_flush(struct flb_event_chunk *event_chunk,
     /* Buffer current chunk in filesystem and wait for next chunk from engine */
     ret = buffer_chunk(ctx, upload_file, chunk, chunk_size,
                        event_chunk->tag, flb_sds_len(event_chunk->tag),
-                       file_first_log_time);
+                       file_first_log_time, &tail_meta);
 
     if (ret < 0) {
+        s3_tail_source_meta_destroy(&tail_meta);
         FLB_OUTPUT_RETURN(FLB_RETRY);
     }
+    s3_tail_source_meta_destroy(&tail_meta);
     FLB_OUTPUT_RETURN(FLB_OK);
 }
 
@@ -4345,6 +4527,14 @@ static struct flb_config_map config_map[] = {
      "Disables behavior where UUID string is automatically appended to end of S3 key name when "
      "$UUID is not provided in s3_key_format. $UUID, time formatters, $TAG, and other dynamic "
      "key formatters all work as expected while this feature is set to true."
+    },
+
+    {
+     FLB_CONFIG_MAP_BOOL, "replace_buffer_on_whole_file_update", "false",
+     0, FLB_TRUE, offsetof(struct flb_s3, replace_buffer_on_whole_file_update),
+     "When Tail emits whole-file update metadata, discard an unlocked pending "
+     "S3 local buffer for the same Tail source before buffering a newer "
+     "whole-file generation."
     },
 
     {

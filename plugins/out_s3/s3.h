@@ -125,6 +125,7 @@ struct flb_s3 {
     int use_put_object;
     int send_content_md5;
     int static_file_path;
+    int replace_buffer_on_whole_file_update;
     int retry_exhausted_action;
     int compression;
     int port;

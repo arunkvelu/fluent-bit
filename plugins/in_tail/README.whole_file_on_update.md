@@ -70,6 +70,24 @@ if current_size > stored_offset:
 No additional state is written to the database. The stored offset continues to
 represent the last resumable EOF position.
 
+## Buffering And Duplicate Records
+
+`Whole_File_On_Update` does not replace records that were already appended to
+the Fluent Bit engine or to an output plugin buffer. Each whole-file reread is
+emitted as a new set of Tail records.
+
+For example, if a file contains records `A` and `B`, and then grows with record
+`C`, Tail forwards `A`, `B`, and `C` again on that update. Downstream outputs
+such as S3 receive those records as new input data. If the output appends to a
+buffer, writes unique object names, or uses multipart upload state, the previous
+records can appear again in later uploaded objects.
+
+This option is best suited for pipelines where the final destination overwrites
+the same object/path with the latest full file content, or where duplicate
+records are acceptable and handled downstream. It is not a deduplication
+feature, and it does not remove previously buffered records from the engine or
+from output plugins.
+
 ## Database Behavior
 
 The Tail database keeps the same schema and semantics.
@@ -77,8 +95,9 @@ The Tail database keeps the same schema and semantics.
 The database still stores the current file offset after successful processing.
 When Fluent Bit restarts, Tail restores that offset exactly as before. If the
 file has not grown beyond the stored offset, no data is replayed. If the file
-has grown and `Whole_File_On_Update` is enabled, Tail uses the restored offset
-only to detect growth, then seeks to the beginning of the file for the read.
+has grown while Fluent Bit was stopped, startup processing catches up from the
+stored offset. Whole-file rereads are applied only after the file is already
+being monitored in event mode.
 
 This means the database remains responsible for:
 
@@ -161,3 +180,6 @@ Runtime tests were added for:
 - `db_whole_file_on_update`: verifies that the database offset is still restored
   after restart, and that whole-file forwarding only happens after the file
   grows beyond the stored offset.
+- `db_whole_file_on_update_startup_offset`: verifies that startup catch-up after
+  a restart reads only from the restored database offset, while later event-mode
+  growth still forwards the whole file.

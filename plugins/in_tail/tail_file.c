@@ -57,6 +57,9 @@
 #include <cfl/cfl.h>
 
 #define FLB_TAIL_DB_OFFSET_MARKER_SIZE 32
+#define FLB_TAIL_WHOLE_FILE_META_ACTIVE     "flb.tail.whole_file_on_update.active"
+#define FLB_TAIL_WHOLE_FILE_META_SOURCE     "flb.tail.whole_file_on_update.source"
+#define FLB_TAIL_WHOLE_FILE_META_GENERATION "flb.tail.whole_file_on_update.generation"
 
 static inline void consume_bytes(char *buf, int bytes, int length)
 {
@@ -427,6 +430,28 @@ static int flb_tail_repack_map(struct flb_log_event_encoder *encoder,
     return result;
 }
 
+static int append_whole_file_update_metadata(struct flb_tail_file *file)
+{
+    int result;
+
+    if (file->whole_file_generation_active != FLB_TRUE ||
+        file->whole_file_generation == 0) {
+        return FLB_EVENT_ENCODER_SUCCESS;
+    }
+
+    result = flb_log_event_encoder_append_metadata_values(
+                file->sl_log_event_encoder,
+                FLB_LOG_EVENT_CSTRING_VALUE(FLB_TAIL_WHOLE_FILE_META_ACTIVE),
+                FLB_LOG_EVENT_BOOLEAN_VALUE(FLB_TRUE),
+                FLB_LOG_EVENT_CSTRING_VALUE(FLB_TAIL_WHOLE_FILE_META_SOURCE),
+                FLB_LOG_EVENT_STRING_VALUE(file->orig_name,
+                                           file->orig_name_len),
+                FLB_LOG_EVENT_CSTRING_VALUE(FLB_TAIL_WHOLE_FILE_META_GENERATION),
+                FLB_LOG_EVENT_UINT64_VALUE(file->whole_file_generation));
+
+    return result;
+}
+
 int flb_tail_pack_line_map(struct flb_time *time, char **data,
                            size_t *data_size, struct flb_tail_file *file,
                            size_t processed_bytes)
@@ -438,6 +463,10 @@ int flb_tail_pack_line_map(struct flb_time *time, char **data,
     if (result == FLB_EVENT_ENCODER_SUCCESS) {
         result = flb_log_event_encoder_set_timestamp(
                     file->sl_log_event_encoder, time);
+    }
+
+    if (result == FLB_EVENT_ENCODER_SUCCESS) {
+        result = append_whole_file_update_metadata(file);
     }
 
     if (result == FLB_EVENT_ENCODER_SUCCESS) {
@@ -497,6 +526,10 @@ int flb_tail_file_pack_line(struct flb_time *time, char *data, size_t data_size,
     if (result == FLB_EVENT_ENCODER_SUCCESS) {
         result = flb_log_event_encoder_set_timestamp(
                     file->sl_log_event_encoder, time);
+    }
+
+    if (result == FLB_EVENT_ENCODER_SUCCESS) {
+        result = append_whole_file_update_metadata(file);
     }
 
     /* path_key */
@@ -1203,6 +1236,11 @@ int flb_tail_file_set_pending_bytes(struct flb_tail_file *file, off_t size)
         if (lseek(file->fd, start_offset, SEEK_SET) == -1) {
             flb_errno();
             return -1;
+        }
+
+        if (start_offset == 0) {
+            file->whole_file_generation++;
+            file->whole_file_generation_active = FLB_TRUE;
         }
 
         file->offset = start_offset;

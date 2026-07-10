@@ -34,6 +34,23 @@ static int s3_store_under_travis_ci()
     return FLB_FALSE;
 }
 
+static void s3_file_context_destroy(struct s3_file *s3_file)
+{
+    if (s3_file == NULL) {
+        return;
+    }
+
+    if (s3_file->file_path != NULL) {
+        flb_sds_destroy(s3_file->file_path);
+    }
+
+    if (s3_file->tail_source != NULL) {
+        flb_sds_destroy(s3_file->tail_source);
+    }
+
+    flb_free(s3_file);
+}
+
 /*
  * Simple and fast hashing algorithm to create keys in the local buffer
  */
@@ -122,11 +139,55 @@ struct s3_file *s3_store_file_get(struct flb_s3 *ctx, const char *tag,
     return fsf->data;
 }
 
+struct s3_file *s3_store_file_get_by_tail_source(struct flb_s3 *ctx,
+                                                 const char *tag,
+                                                 int tag_len,
+                                                 const char *source,
+                                                 size_t source_len)
+{
+    struct mk_list *head;
+    struct mk_list *tmp;
+    struct flb_fstore_file *fsf = NULL;
+    struct s3_file *s3_file;
+
+    mk_list_foreach_safe(head, tmp, &ctx->stream_active->files) {
+        fsf = mk_list_entry(head, struct flb_fstore_file, _head);
+
+        if (fsf->data == NULL) {
+            flb_plg_warn(ctx->ins, "BAD: found flb_fstore_file with NULL data reference, "
+                         "tag=%s, file=%s, will try to delete", tag, fsf->name);
+            flb_fstore_file_delete(ctx->fs, fsf);
+            continue;
+        }
+
+        if (fsf->meta_buf == NULL ||
+            fsf->meta_size != tag_len ||
+            strncmp((char *) fsf->meta_buf, tag, tag_len) != 0) {
+            continue;
+        }
+
+        s3_file = fsf->data;
+        if (s3_file->locked == FLB_TRUE || s3_file->tail_source == NULL) {
+            continue;
+        }
+
+        if (flb_sds_len(s3_file->tail_source) == source_len &&
+            strncmp(s3_file->tail_source, source, source_len) == 0) {
+            return s3_file;
+        }
+    }
+
+    return NULL;
+}
+
 /* Append data to a new or existing fstore file */
 int s3_store_buffer_put(struct flb_s3 *ctx, struct s3_file *s3_file,
                         const char *tag, int tag_len,
                         char *data, size_t bytes,
-                        time_t file_first_log_time)
+                        time_t file_first_log_time,
+                        const char *tail_source,
+                        size_t tail_source_len,
+                        uint64_t tail_source_generation)
 {
     int ret;
     flb_sds_t name;
@@ -184,6 +245,21 @@ int s3_store_buffer_put(struct flb_s3 *ctx, struct s3_file *s3_file,
     }
     else {
         fsf = s3_file->fsf;
+    }
+
+    if (tail_source != NULL && tail_source_len > 0) {
+        if (s3_file->tail_source == NULL) {
+            s3_file->tail_source = flb_sds_create_len(tail_source, tail_source_len);
+            if (s3_file->tail_source == NULL) {
+                flb_errno();
+                if (fsf->data == s3_file && s3_file->size == 0) {
+                    flb_fstore_file_delete(ctx->fs, fsf);
+                    s3_file_context_destroy(s3_file);
+                }
+                return -1;
+            }
+        }
+        s3_file->tail_source_generation = tail_source_generation;
     }
 
     /* Append data to the target file */
@@ -364,8 +440,7 @@ int s3_store_exit(struct flb_s3 *ctx)
             fsf = mk_list_entry(f_head, struct flb_fstore_file, _head);
             if (fsf->data != NULL) {
                 s3_file = fsf->data;
-                flb_sds_destroy(s3_file->file_path);
-                flb_free(s3_file);
+                s3_file_context_destroy(s3_file);
             }
         }
     }
@@ -424,7 +499,7 @@ int s3_store_file_inactive(struct flb_s3 *ctx, struct s3_file *s3_file)
     struct flb_fstore_file *fsf;
 
     fsf = s3_file->fsf;
-    flb_free(s3_file);
+    s3_file_context_destroy(s3_file);
     ret = flb_fstore_file_inactive(ctx->fs, fsf);
 
     return ret;
@@ -467,7 +542,7 @@ int s3_store_file_quarantine(struct flb_s3 *ctx, struct s3_file *s3_file)
     }
 
     flb_fstore_file_delete(ctx->fs, fsf);
-    flb_free(s3_file);
+    s3_file_context_destroy(s3_file);
     return 0;
 }
 
@@ -480,7 +555,7 @@ int s3_store_file_delete(struct flb_s3 *ctx, struct s3_file *s3_file)
 
     /* permanent deletion */
     flb_fstore_file_delete(ctx->fs, fsf);
-    flb_free(s3_file);
+    s3_file_context_destroy(s3_file);
 
     return 0;
 }

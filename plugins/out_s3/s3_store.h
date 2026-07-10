@@ -30,13 +30,18 @@ struct s3_file {
     time_t create_time;              /* creation time */
     time_t first_log_time;           /* first log time */
     flb_sds_t file_path;             /* file path */
+    flb_sds_t tail_source;           /* tail whole-file update source */
+    uint64_t tail_source_generation; /* tail whole-file update generation */
     struct flb_fstore_file *fsf;     /* reference to parent flb_fstore_file */
 };
 
 int s3_store_buffer_put(struct flb_s3 *ctx, struct s3_file *s3_file,
                         const char *tag, int tag_len,
                         char *data, size_t bytes,
-                        time_t file_first_log_time);
+                        time_t file_first_log_time,
+                        const char *tail_source,
+                        size_t tail_source_len,
+                        uint64_t tail_source_generation);
 
 int s3_store_init(struct flb_s3 *ctx);
 int s3_store_exit(struct flb_s3 *ctx);
@@ -48,6 +53,11 @@ int s3_store_file_inactive(struct flb_s3 *ctx, struct s3_file *s3_file);
 int s3_store_file_quarantine(struct flb_s3 *ctx, struct s3_file *s3_file);
 struct s3_file *s3_store_file_get(struct flb_s3 *ctx, const char *tag,
                                   int tag_len);
+struct s3_file *s3_store_file_get_by_tail_source(struct flb_s3 *ctx,
+                                                 const char *tag,
+                                                 int tag_len,
+                                                 const char *source,
+                                                 size_t source_len);
 int s3_store_file_delete(struct flb_s3 *ctx, struct s3_file *s3_file);
 int s3_store_file_read(struct flb_s3 *ctx, struct s3_file *s3_file,
                        char **out_buf, size_t *out_size);
